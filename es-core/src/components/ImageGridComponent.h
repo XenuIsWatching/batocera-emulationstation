@@ -3,6 +3,10 @@
 #define ES_CORE_COMPONENTS_IMAGE_GRID_COMPONENT_H
 
 #include "Log.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include "components/IList.h"
 #include "resources/TextureResource.h"
 #include "GridTileComponent.h"
@@ -53,6 +57,7 @@ struct ImageGridData
 {
 	std::shared_ptr<GridTileComponent> tile;
 	std::string texturePath;
+	bool needsMediaReload = false; // true when loadTile deferred due to uncached paths
 };
 
 // Type trait to check if a type derives from IBindable
@@ -83,6 +88,7 @@ public:
 	using IList<ImageGridData, T>::updateBindings;
 
 	ImageGridComponent(Window* window);
+	~ImageGridComponent();
 
 	std::string getThemeTypeName() override { return "imagegrid"; }
 
@@ -195,6 +201,15 @@ private:
 	ScrollbarComponent mScrollbar;
 
 	std::function<void(CursorState state)> mCursorChangedCallback;
+
+	// Background thread for statting media paths that weren't in the file-existence
+	// cache at loadTile time, so the render thread never blocks on stat64.
+	std::thread           mTileStatThread;
+	std::mutex            mTileStatMutex;
+	std::condition_variable mTileStatCV;
+	std::deque<std::string> mTileStatQueue;
+	bool                  mTileStatStop;
+	bool                  mHasDeferredLoads;
 
 	// Mouse
 	int		  mPressedCursor;
@@ -467,6 +482,39 @@ ImageGridComponent<T>::ImageGridComponent(Window* window) : IList<ImageGridData,
 	mScrollDirection = SCROLL_VERTICALLY;
 
 	mCursorChangedCallback = nullptr;
+
+	mTileStatStop = false;
+	mHasDeferredLoads = false;
+	mTileStatThread = std::thread([this]()
+	{
+		while (true)
+		{
+			std::string path;
+			{
+				std::unique_lock<std::mutex> lock(mTileStatMutex);
+				mTileStatCV.wait(lock, [this] { return mTileStatStop || !mTileStatQueue.empty(); });
+				if (mTileStatStop && mTileStatQueue.empty()) break;
+				if (mTileStatQueue.empty()) continue;
+				path = std::move(mTileStatQueue.front());
+				mTileStatQueue.pop_front();
+			}
+			// Stat outside the lock — populates FileCache for the render thread
+			Utils::FileSystem::exists(path);
+		}
+	});
+}
+
+template<typename T>
+ImageGridComponent<T>::~ImageGridComponent()
+{
+	{
+		std::lock_guard<std::mutex> lock(mTileStatMutex);
+		mTileStatStop = true;
+		mTileStatQueue.clear();
+	}
+	mTileStatCV.notify_all();
+	if (mTileStatThread.joinable())
+		mTileStatThread.join();
 }
 
 template<typename T>
@@ -484,7 +532,14 @@ void ImageGridComponent<T>::add(const std::string& name, const std::string& imag
 
 template<typename T>
 void ImageGridComponent<T>::clear()
-{	
+{
+	// Drain the deferred queue so the background thread doesn't reload stale entries
+	{
+		std::lock_guard<std::mutex> lock(mTileStatMutex);
+		mTileStatQueue.clear();
+	}
+	mHasDeferredLoads = false;
+
 	IList<ImageGridData, T>::clear();
 	resetGrid();
 }
@@ -606,6 +661,42 @@ void ImageGridComponent<T>::update(int deltaTime)
 		if (entry.data.tile != nullptr && entry.data.tile->isVisible())
 			entry.data.tile->update(deltaTime);
 	*/
+
+	// Re-load any tiles that were previously deferred because their media paths
+	// weren't in the file-existence cache yet.  Now that the background stat thread
+	// has had a chance to run, re-check and load for tiles whose paths are cached.
+	if (mHasDeferredLoads)
+	{
+		bool anyRemaining = false;
+		for (auto& entry : mEntries)
+		{
+			if (!entry.data.needsMediaReload) continue;
+			if (entry.data.tile == nullptr || !entry.data.tile->isVisible())
+			{
+				// Keep the flag; tile may become visible later
+				anyRemaining = true;
+				continue;
+			}
+
+			IBindable* bindable = getBindable(entry);
+			std::string imgPath  = entry.data.texturePath;
+			std::string mqPath   = bindable ? bindable->getProperty("marquee").toString() : "";
+			std::string vidPath  = bindable ? bindable->getProperty("video").toString() : "";
+
+			bool allCached = (imgPath.empty()  || Utils::FileSystem::isCached(imgPath)) &&
+			                 (mqPath.empty()   || Utils::FileSystem::isCached(mqPath))  &&
+			                 (vidPath.empty()  || Utils::FileSystem::isCached(vidPath));
+
+			if (allCached)
+			{
+				entry.data.needsMediaReload = false;
+				loadTile(entry.data.tile, entry);
+			}
+			else
+				anyRemaining = true;
+		}
+		mHasDeferredLoads = anyRemaining;
+	}
 }
 
 template<typename T>
@@ -1288,9 +1379,50 @@ void ImageGridComponent<T>::loadTile(std::shared_ptr<GridTileComponent> tile, ty
 
 	bool cheevos = bindable ? bindable->getProperty("cheevos").toBoolean() : false;
 	bool folder = bindable ? bindable->getProperty("folder").toBoolean() : false;
-	bool virtualFolder = bindable ? bindable->getProperty("virtualfolder").toBoolean() : false; 
+	bool virtualFolder = bindable ? bindable->getProperty("virtualfolder").toBoolean() : false;
 
 	bool preloadMedias = Settings::PreloadMedias();
+
+	// When not pre-loading, check whether the paths are already in the file-existence
+	// cache.  If any are missing, show placeholder content immediately (non-blocking)
+	// and schedule background stat work.  The tile will be re-loaded on the next
+	// update() once the cache is populated, keeping the render thread stat64-free.
+	if (!preloadMedias)
+	{
+		std::vector<std::string> uncachedPaths;
+		if (!imagePath.empty() && !Utils::FileSystem::isCached(imagePath))
+			uncachedPaths.push_back(imagePath);
+		if (tile->hasMarquee() && !marqueePath.empty() && !Utils::FileSystem::isCached(marqueePath))
+			uncachedPaths.push_back(marqueePath);
+		if (mAllowVideo && !videoPath.empty() && !Utils::FileSystem::isCached(videoPath))
+			uncachedPaths.push_back(videoPath);
+
+		if (!uncachedPaths.empty())
+		{
+			// Show placeholder right now — zero blocking
+			if (folder)
+				tile->setImage(mDefaultFolderTexture, mDefaultFolderTexture == ":/folder.svg");
+			else
+				tile->setImage(mDefaultGameTexture, mDefaultGameTexture == ":/cartridge.svg");
+			if (tile->hasMarquee()) tile->setMarquee("");
+			tile->setVideo("", 0);
+			tile->setFavorite(favorite);
+			tile->setCheevos(cheevos);
+
+			// Queue paths for background stat (high-priority front insert so
+			// newly-visible tiles are processed before pre-warm tail work)
+			{
+				std::lock_guard<std::mutex> lock(mTileStatMutex);
+				for (auto& p : uncachedPaths)
+					mTileStatQueue.push_front(std::move(p));
+			}
+			mTileStatCV.notify_one();
+
+			entry.data.needsMediaReload = true;
+			mHasDeferredLoads = true;
+			return;
+		}
+	}
 
 	bool setMarquee = true;
 

@@ -1,6 +1,7 @@
 #include "views/gamelist/GridGameListView.h"
 
 #include "animations/LambdaAnimation.h"
+#include <thread>
 #include "views/UIModeController.h"
 #include "views/ViewController.h"
 #include "CollectionSystemManager.h"
@@ -192,6 +193,35 @@ void GridGameListView::populateList(const std::vector<FileData*>& files)
 
 		for (auto file : files)
 			mGrid.add(formatter.getDisplayName(file, file->getType() == FOLDER && Utils::FileSystem::exists(getImagePath(file))), getImagePath(file), file);
+
+		// Pre-warm the file-existence cache in a background thread so that
+		// fileExists() calls in loadTile() hit the shared_lock fast path
+		// instead of blocking the render thread on stat64 (especially slow
+		// on network-backed media libraries).  We bulk-read each unique parent
+		// directory via getDirContent — one readdir per directory instead of
+		// one stat64 per file, which makes a large difference on network shares.
+		{
+			std::set<std::string> mediaDirs;
+			for (auto file : files)
+			{
+				std::string img = getImagePath(file);
+				if (!img.empty()) mediaDirs.insert(Utils::FileSystem::getParent(img));
+
+				std::string mq = file->getMetadata(MetaDataId::Marquee);
+				if (!mq.empty()) mediaDirs.insert(Utils::FileSystem::getParent(mq));
+
+				std::string vid = file->getMetadata(MetaDataId::Video);
+				if (!vid.empty()) mediaDirs.insert(Utils::FileSystem::getParent(vid));
+			}
+			if (!mediaDirs.empty())
+			{
+				std::thread([dirs = std::move(mediaDirs)]()
+				{
+					for (const auto& d : dirs)
+						Utils::FileSystem::getDirContent(d, false, true);
+				}).detach();
+			}
+		}
 
 		// if we have the ".." PLACEHOLDER, then select the first game instead of the placeholder
 		if (showParentFolder && mCursorStack.size() && mGrid.size() > 1 && mGrid.getCursorIndex() == 0)

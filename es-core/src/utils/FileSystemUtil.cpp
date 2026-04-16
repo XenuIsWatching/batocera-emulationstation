@@ -204,6 +204,22 @@ namespace Utils
 				return std::nullopt;
 			}
 
+			// Non-blocking probe: returns true if the key's existence is already
+			// recorded in the cache (either exists or known-not-to-exist).
+			// Never calls stat64 — safe to call from the render thread.
+			static bool isCached(const std::string& key)
+			{
+				if (!Settings::UseFileCache())
+					return false;
+
+				auto hash = hashPath(key);
+				std::shared_lock<std::shared_mutex> lock(mFileCacheMutex);
+				if (mFileCache.count(hash))
+					return true;
+				// Also consider a parent-wildcard entry as covering this path
+				return mFileCache.count(hashPath(Utils::FileSystem::getParent(key) + "/*")) > 0;
+			}
+
 			static std::optional<bool> isRegularFile(const std::string& key)
 			{
 				std::unique_lock<std::mutex> lock(mFileCacheMutex);
@@ -1110,6 +1126,11 @@ namespace Utils
 			return FileCache::fromStat64(path, &info) == 0;
 #endif
 		} // exists
+
+		bool isCached(const std::string& _path)
+		{
+			return FileCache::isCached(_path);
+		}
 
 		bool isAbsolute(const std::string& _path)
 		{
