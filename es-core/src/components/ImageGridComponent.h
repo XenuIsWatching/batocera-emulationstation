@@ -204,7 +204,7 @@ private:
 
 	// Background thread for statting media paths that weren't in the file-existence
 	// cache at loadTile time, so the render thread never blocks on stat64.
-	std::thread           mTileStatThread;
+	std::vector<std::thread> mTileStatThreads;
 	std::mutex            mTileStatMutex;
 	std::condition_variable mTileStatCV;
 	std::deque<std::string> mTileStatQueue;
@@ -485,23 +485,32 @@ ImageGridComponent<T>::ImageGridComponent(Window* window) : IList<ImageGridData,
 
 	mTileStatStop = false;
 	mHasDeferredLoads = false;
-	mTileStatThread = std::thread([this]()
+
+	// Spawn a pool of worker threads so multiple stat64 calls can be in-flight
+	// simultaneously — important for network paths (NAS/SMB) where each stat
+	// has significant round-trip latency.  All workers drain the same queue.
+	const unsigned int numWorkers = std::max(1u, std::min(std::thread::hardware_concurrency(), 4u));
+	mTileStatThreads.reserve(numWorkers);
+	for (unsigned int i = 0; i < numWorkers; ++i)
 	{
-		while (true)
+		mTileStatThreads.emplace_back([this]()
 		{
-			std::string path;
+			while (true)
 			{
-				std::unique_lock<std::mutex> lock(mTileStatMutex);
-				mTileStatCV.wait(lock, [this] { return mTileStatStop || !mTileStatQueue.empty(); });
-				if (mTileStatStop && mTileStatQueue.empty()) break;
-				if (mTileStatQueue.empty()) continue;
-				path = std::move(mTileStatQueue.front());
-				mTileStatQueue.pop_front();
+				std::string path;
+				{
+					std::unique_lock<std::mutex> lock(mTileStatMutex);
+					mTileStatCV.wait(lock, [this] { return mTileStatStop || !mTileStatQueue.empty(); });
+					if (mTileStatStop && mTileStatQueue.empty()) break;
+					if (mTileStatQueue.empty()) continue;
+					path = std::move(mTileStatQueue.front());
+					mTileStatQueue.pop_front();
+				}
+				// Stat outside the lock — populates FileCache for the render thread
+				Utils::FileSystem::exists(path);
 			}
-			// Stat outside the lock — populates FileCache for the render thread
-			Utils::FileSystem::exists(path);
-		}
-	});
+		});
+	}
 }
 
 template<typename T>
@@ -513,8 +522,8 @@ ImageGridComponent<T>::~ImageGridComponent()
 		mTileStatQueue.clear();
 	}
 	mTileStatCV.notify_all();
-	if (mTileStatThread.joinable())
-		mTileStatThread.join();
+	for (auto& t : mTileStatThreads)
+		if (t.joinable()) t.join();
 }
 
 template<typename T>
