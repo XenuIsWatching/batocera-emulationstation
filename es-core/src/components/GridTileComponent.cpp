@@ -58,7 +58,8 @@ void GridTileComponent::resetProperties()
 	mSelectedProperties.Size = getSelectedTileSize();
 	mSelectedProperties.Padding = mDefaultProperties.Padding;
 
-	mDefaultProperties.Label = mSelectedProperties.Label = GridTextProperties();	
+	mDefaultProperties.Label = mSelectedProperties.Label = GridTextProperties();
+	mSelectedProperties.Label.autoScroll = true;
 	mDefaultProperties.Image = mSelectedProperties.Image = GridImageProperties();	
 	mDefaultProperties.Marquee = mSelectedProperties.Marquee = GridImageProperties();
 	mDefaultProperties.Favorite = mSelectedProperties.Favorite = GridImageProperties();

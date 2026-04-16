@@ -87,6 +87,7 @@ public:
 		glowColor = 0;
 		glowSize = 0;
 		padding = Vector4f::Zero();
+		autoScroll = false;
 	}
 
 	void mixProperties(GridTextProperties& def, GridTextProperties& sel, float percent);
